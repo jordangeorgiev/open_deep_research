@@ -1,0 +1,56 @@
+use_default_settings: true
+
+server:
+  secret_key: "change-this-secret-in-production"
+  limiter: false
+  image_proxy: true
+  method: "GET"
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+  formats:
+    - html
+    - json
+
+ui:
+  static_use_hash: true
+  infinite_scroll: true
+  default_theme: simple
+
+enabled_engines:
+  - google
+  - duckduckgo
+  - brave
+  - wikipedia
+  - arxiv
+  - github
+  - stackoverflow
+  - reddit
+
+engines:
+  - name: google
+    engine: google
+    shortcut: go
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+  - name: brave
+    engine: brave
+    shortcut: br
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+  - name: arxiv
+    engine: arxiv
+    shortcut: arx
+  - name: github
+    engine: github
+    shortcut: gh
+  - name: stackoverflow
+    engine: stackoverflow
+    shortcut: so
+  - name: reddit
+    engine: reddit
+    shortcut: re

@@ -10,7 +10,8 @@ from pydantic import BaseModel, Field
 
 class SearchAPI(Enum):
     """Enumeration of available search API providers."""
-    
+
+    SEARXNG = "searxng"
     ANTHROPIC = "anthropic"
     OPENAI = "openai"
     TAVILY = "tavily"
@@ -83,6 +84,7 @@ class Configuration(BaseModel):
                 "default": "tavily",
                 "description": "Search API to use for research. NOTE: Make sure your Researcher Model supports the selected search API.",
                 "options": [
+                    {"label": "SearXNG (Local)", "value": SearchAPI.SEARXNG.value},
                     {"label": "Tavily", "value": SearchAPI.TAVILY.value},
                     {"label": "OpenAI Native Web Search", "value": SearchAPI.OPENAI.value},
                     {"label": "Anthropic Native Web Search", "value": SearchAPI.ANTHROPIC.value},
@@ -147,6 +149,16 @@ class Configuration(BaseModel):
                 "min": 1000,
                 "max": 200000,
                 "description": "Maximum character length for webpage content before summarization"
+            }
+        }
+    )
+    searxng_url: str = Field(
+        default="http://localhost:8080",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "http://localhost:8080",
+                "description": "URL of the local SearXNG instance"
             }
         }
     )

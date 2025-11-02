@@ -1,11 +1,12 @@
 """Utility functions and helpers for the Deep Research agent."""
 
 import asyncio
+import json
 import logging
 import os
 import warnings
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any, Dict, List, Literal, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional, Type, TypeVar
 
 import aiohttp
 from langchain.chat_models import init_chat_model
@@ -14,6 +15,7 @@ from langchain_core.messages import (
     AIMessage,
     HumanMessage,
     MessageLikeRepresentation,
+    SystemMessage,
     filter_messages,
 )
 from langchain_core.runnables import RunnableConfig
@@ -27,11 +29,180 @@ from langchain_core.tools import (
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.config import get_store
 from mcp import McpError
+from pydantic import BaseModel, ValidationError
 from tavily import AsyncTavilyClient
 
 from open_deep_research.configuration import Configuration, SearchAPI
 from open_deep_research.prompts import summarize_webpage_prompt
 from open_deep_research.state import ResearchComplete, Summary
+
+T = TypeVar('T', bound=BaseModel)
+
+##########################
+# Structured Output Compatibility Utils
+##########################
+
+def supports_structured_output(model_name: str) -> bool:
+    """Check if a model supports LangChain's with_structured_output() method.
+
+    Args:
+        model_name: The model identifier string
+
+    Returns:
+        True if the model supports structured output, False otherwise
+    """
+    model_str = str(model_name).lower()
+
+    # Models that support structured output
+    supported_providers = [
+        'openai:',
+        'anthropic:',
+        'google:',
+        'gemini:',
+    ]
+
+    # Ollama and other local models don't support structured output
+    unsupported_providers = [
+        'ollama:',
+        'together:',
+        'groq:',  # Groq may support it, but being conservative
+    ]
+
+    # Check if it's an unsupported provider
+    for provider in unsupported_providers:
+        if model_str.startswith(provider):
+            return False
+
+    # Check if it's a supported provider
+    for provider in supported_providers:
+        if model_str.startswith(provider):
+            return True
+
+    # Default to False for unknown providers
+    return False
+
+def get_model_with_structured_output(
+    model: BaseChatModel,
+    model_name: str,
+    schema: Type[T],
+    max_retries: int = 3
+) -> BaseChatModel:
+    """Get a model configured for structured output with fallback to JSON mode.
+
+    This function handles both models that support with_structured_output()
+    (like OpenAI, Anthropic) and those that don't (like Ollama), providing
+    a consistent interface for getting structured responses.
+
+    Args:
+        model: The base chat model instance
+        model_name: The model identifier string
+        schema: Pydantic model class for the expected output structure
+        max_retries: Maximum number of retry attempts
+
+    Returns:
+        Configured model that can return structured output
+    """
+    if supports_structured_output(model_name):
+        # Use native structured output for supported models
+        return model.with_structured_output(schema).with_retry(
+            stop_after_attempt=max_retries
+        )
+    else:
+        # For Ollama and other models, we'll use JSON mode
+        # Return the base model - we'll handle JSON parsing manually
+        return model.with_retry(stop_after_attempt=max_retries)
+
+async def get_structured_output_from_model(
+    model: BaseChatModel,
+    model_name: str,
+    messages: List[MessageLikeRepresentation],
+    schema: Type[T],
+    schema_name: str = "output"
+) -> T:
+    """Get structured output from a model with automatic fallback to JSON parsing.
+
+    For models that support structured output (OpenAI, Anthropic), uses that directly.
+    For Ollama and other models, instructs them to output JSON and parses it.
+
+    Args:
+        model: The chat model instance
+        model_name: The model identifier
+        messages: List of messages to send to the model
+        schema: Pydantic model class for validation
+        schema_name: Name to use in JSON schema description
+
+    Returns:
+        Validated instance of the schema type
+
+    Raises:
+        ValidationError: If the model's output doesn't match the schema
+    """
+    if supports_structured_output(model_name):
+        # Model supports structured output directly
+        response = await model.ainvoke(messages)
+        return response
+    else:
+        # Use JSON mode for Ollama and similar models
+        # Add JSON schema instruction to the last message
+        schema_dict = schema.model_json_schema()
+
+        # Create a clearer example of what we expect
+        field_descriptions = []
+        for field_name, field_info in schema_dict.get('properties', {}).items():
+            field_desc = field_info.get('description', '')
+            field_type = field_info.get('type', 'string')
+            field_descriptions.append(f'  "{field_name}": <{field_type}> - {field_desc}')
+
+        json_instruction = f"""
+
+IMPORTANT: You must respond with a valid JSON object (NOT the schema itself).
+
+Required JSON format:
+{{
+{chr(10).join(field_descriptions)}
+}}
+
+Respond ONLY with a JSON object containing actual values for these fields. Do NOT return the schema definition itself."""
+
+        # Clone messages and add instruction to last message
+        modified_messages = list(messages)
+        if modified_messages:
+            last_msg = modified_messages[-1]
+            if isinstance(last_msg, HumanMessage):
+                modified_messages[-1] = HumanMessage(
+                    content=last_msg.content + json_instruction
+                )
+            else:
+                # If last message isn't human, add a new one
+                modified_messages.append(HumanMessage(content=json_instruction))
+
+        # Get response from model
+        response = await model.ainvoke(modified_messages)
+
+        # Parse JSON from response
+        response_text = response.content if hasattr(response, 'content') else str(response)
+
+        # Try to extract JSON from markdown code blocks if present
+        if '```json' in response_text:
+            json_start = response_text.find('```json') + 7
+            json_end = response_text.find('```', json_start)
+            if json_end > json_start:
+                response_text = response_text[json_start:json_end].strip()
+        elif '```' in response_text:
+            # Generic code block
+            json_start = response_text.find('```') + 3
+            json_end = response_text.find('```', json_start)
+            if json_end > json_start:
+                response_text = response_text[json_start:json_end].strip()
+
+        # Parse and validate JSON
+        try:
+            parsed_data = json.loads(response_text.strip())
+            return schema(**parsed_data)
+        except (json.JSONDecodeError, ValidationError) as e:
+            logging.error(f"Failed to parse structured output from {model_name}: {e}")
+            logging.error(f"Response was: {response_text[:500]}")
+            raise
 
 ##########################
 # Tavily Search Tool Utils
@@ -77,31 +248,38 @@ async def tavily_search(
     
     # Step 3: Set up the summarization model with configuration
     configurable = Configuration.from_runnable_config(config)
-    
+
     # Character limit to stay within model token limits (configurable)
     max_char_to_include = configurable.max_content_length
-    
+
     # Initialize summarization model with retry logic
     model_api_key = get_api_key_for_model(configurable.summarization_model, config)
-    summarization_model = init_chat_model(
+    base_model = init_chat_model(
         model=configurable.summarization_model,
         max_tokens=configurable.summarization_model_max_tokens,
         api_key=model_api_key,
         tags=["langsmith:nostream"]
-    ).with_structured_output(Summary).with_retry(
-        stop_after_attempt=configurable.max_structured_output_retries
     )
-    
+
+    # Use our helper to configure structured output with Ollama support
+    summarization_model = get_model_with_structured_output(
+        base_model,
+        configurable.summarization_model,
+        Summary,
+        configurable.max_structured_output_retries
+    )
+
     # Step 4: Create summarization tasks (skip empty content)
     async def noop():
         """No-op function for results without raw content."""
         return None
-    
+
     summarization_tasks = [
-        noop() if not result.get("raw_content") 
+        noop() if not result.get("raw_content")
         else summarize_webpage(
-            summarization_model, 
-            result['raw_content'][:max_char_to_include]
+            summarization_model,
+            result['raw_content'][:max_char_to_include],
+            configurable.summarization_model
         )
         for result in unique_results.values()
     ]
@@ -172,37 +350,56 @@ async def tavily_search_async(
     search_results = await asyncio.gather(*search_tasks)
     return search_results
 
-async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
+async def summarize_webpage(
+    model: BaseChatModel,
+    webpage_content: str,
+    model_name: str = None
+) -> str:
     """Summarize webpage content using AI model with timeout protection.
-    
+
     Args:
         model: The chat model configured for summarization
         webpage_content: Raw webpage content to be summarized
-        
+        model_name: Optional model name for determining structured output support
+
     Returns:
         Formatted summary with key excerpts, or original content if summarization fails
     """
     try:
         # Create prompt with current date context
         prompt_content = summarize_webpage_prompt.format(
-            webpage_content=webpage_content, 
+            webpage_content=webpage_content,
             date=get_today_str()
         )
-        
-        # Execute summarization with timeout to prevent hanging
-        summary = await asyncio.wait_for(
-            model.ainvoke([HumanMessage(content=prompt_content)]),
-            timeout=60.0  # 60 second timeout for summarization
-        )
-        
+
+        # Determine if we need to use structured output helper
+        if model_name and not supports_structured_output(model_name):
+            # Use JSON mode for Ollama and similar models
+            summary = await asyncio.wait_for(
+                get_structured_output_from_model(
+                    model,
+                    model_name,
+                    [HumanMessage(content=prompt_content)],
+                    Summary,
+                    "webpage_summary"
+                ),
+                timeout=60.0
+            )
+        else:
+            # Use native structured output for OpenAI/Anthropic
+            summary = await asyncio.wait_for(
+                model.ainvoke([HumanMessage(content=prompt_content)]),
+                timeout=60.0
+            )
+
         # Format the summary with structured sections
         formatted_summary = (
             f"<summary>\n{summary.summary}\n</summary>\n\n"
             f"<key_excerpts>\n{summary.key_excerpts}\n</key_excerpts>"
         )
-        
+
         return formatted_summary
-        
+
     except asyncio.TimeoutError:
         # Timeout during summarization - return original content
         logging.warning("Summarization timed out after 60 seconds, returning original content")
@@ -211,6 +408,485 @@ async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
         # Other errors during summarization - log and return original content
         logging.warning(f"Summarization failed with error: {str(e)}, returning original content")
         return webpage_content
+
+##########################
+# SearXNG Search Tool Utils
+##########################
+SEARXNG_SEARCH_DESCRIPTION = (
+    "A local privacy-focused metasearch engine that aggregates results from multiple sources. "
+    "Useful for when you need to answer questions about current events using local search infrastructure."
+)
+
+@tool(description=SEARXNG_SEARCH_DESCRIPTION)
+async def searxng_search(
+    queries: List[str],
+    max_results: Annotated[int, InjectedToolArg] = 5,
+    config: RunnableConfig = None
+) -> str:
+    """Fetch and summarize search results from SearXNG local search engine.
+
+    Args:
+        queries: List of search queries to execute
+        max_results: Maximum number of results to return per query
+        config: Runtime configuration for SearXNG URL and model settings
+
+    Returns:
+        Formatted string containing summarized search results
+    """
+    # Step 1: Execute search queries asynchronously
+    search_results = await searxng_search_async(
+        queries,
+        max_results=max_results,
+        config=config
+    )
+
+    # Step 2: Deduplicate results by URL to avoid processing the same content multiple times
+    unique_results = {}
+    for response in search_results:
+        for result in response.get('results', []):
+            url = result.get('url')
+            if url and url not in unique_results:
+                unique_results[url] = {
+                    'title': result.get('title', 'No title'),
+                    'content': result.get('content', ''),
+                    'query': response.get('query', '')
+                }
+
+    # Step 3: Set up the summarization model with configuration
+    configurable = Configuration.from_runnable_config(config)
+
+    # Character limit to stay within model token limits (configurable)
+    max_char_to_include = configurable.max_content_length
+
+    # Initialize summarization model with retry logic
+    model_api_key = get_api_key_for_model(configurable.summarization_model, config)
+    base_model = init_chat_model(
+        model=configurable.summarization_model,
+        max_tokens=configurable.summarization_model_max_tokens,
+        api_key=model_api_key,
+        tags=["langsmith:nostream"]
+    )
+
+    # Use our helper to configure structured output with Ollama support
+    summarization_model = get_model_with_structured_output(
+        base_model,
+        configurable.summarization_model,
+        Summary,
+        configurable.max_structured_output_retries
+    )
+
+    # Step 4: Create summarization tasks (skip empty content)
+    async def noop():
+        """No-op function for results without content."""
+        return None
+
+    summarization_tasks = [
+        noop() if not result.get("content")
+        else summarize_webpage(
+            summarization_model,
+            result['content'][:max_char_to_include],
+            configurable.summarization_model
+        )
+        for result in unique_results.values()
+    ]
+
+    # Step 5: Execute all summarization tasks in parallel
+    summaries = await asyncio.gather(*summarization_tasks)
+
+    # Step 6: Combine results with their summaries
+    summarized_results = {
+        url: {
+            'title': result['title'],
+            'content': result['content'] if summary is None else summary
+        }
+        for url, result, summary in zip(
+            unique_results.keys(),
+            unique_results.values(),
+            summaries
+        )
+    }
+
+    # Step 7: Format the final output
+    if not summarized_results:
+        return "No valid search results found. Please try different search queries or check SearXNG server status."
+
+    formatted_output = "Search results: \n\n"
+    for i, (url, result) in enumerate(summarized_results.items()):
+        formatted_output += f"\n\n--- SOURCE {i+1}: {result['title']} ---\n"
+        formatted_output += f"URL: {url}\n\n"
+        formatted_output += f"SUMMARY:\n{result['content']}\n\n"
+        formatted_output += "\n\n" + "-" * 80 + "\n"
+
+    return formatted_output
+
+async def searxng_search_async(
+    search_queries: List[str],
+    max_results: int = 5,
+    config: RunnableConfig = None
+):
+    """Execute multiple SearXNG search queries asynchronously.
+
+    Args:
+        search_queries: List of search query strings to execute
+        max_results: Maximum number of results per query
+        config: Runtime configuration for SearXNG URL access
+
+    Returns:
+        List of search result dictionaries from SearXNG API
+    """
+    # Get SearXNG URL from configuration
+    configurable = Configuration.from_runnable_config(config)
+    searxng_url = configurable.searxng_url.rstrip('/')
+
+    async def execute_search(query: str):
+        """Execute a single SearXNG search query."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                # SearXNG search endpoint with JSON format
+                search_url = f"{searxng_url}/search"
+                params = {
+                    'q': query,
+                    'format': 'json',
+                    'pageno': 1
+                }
+
+                async with session.get(search_url, params=params, timeout=30) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        # Add query to response for tracking
+                        return {
+                            'query': query,
+                            'results': data.get('results', [])[:max_results]
+                        }
+                    else:
+                        logging.warning(f"SearXNG search failed with status {response.status} for query: {query}")
+                        return {'query': query, 'results': []}
+
+        except asyncio.TimeoutError:
+            logging.warning(f"SearXNG search timed out for query: {query}")
+            return {'query': query, 'results': []}
+        except Exception as e:
+            logging.warning(f"SearXNG search error for query '{query}': {str(e)}")
+            return {'query': query, 'results': []}
+
+    # Create search tasks for parallel execution
+    search_tasks = [execute_search(query) for query in search_queries]
+
+    # Execute all search queries in parallel and return results
+    search_results = await asyncio.gather(*search_tasks)
+    return search_results
+
+##########################
+# Ollama Tool Calling Emulation (ReAct Style)
+##########################
+
+def format_tools_for_ollama(tools: List[Any]) -> str:
+    """Format tools as text descriptions for Ollama models.
+
+    Args:
+        tools: List of tools (can be BaseTools, dicts, or Pydantic classes)
+
+    Returns:
+        Formatted string describing all available tools
+    """
+    tool_descriptions = []
+
+    for tool in tools:
+        # Handle different tool types
+        if isinstance(tool, dict):
+            # Native API tools like web_search
+            tool_name = tool.get('name', tool.get('type', 'unknown'))
+            tool_desc = f"Tool for {tool_name}"
+            tool_descriptions.append(f"- **{tool_name}**: {tool_desc}")
+
+        elif isinstance(tool, type) and issubclass(tool, BaseModel):
+            # Pydantic model tools like ConductResearch
+            tool_name = tool.__name__
+            tool_desc = tool.__doc__ or f"Use {tool_name}"
+
+            # Get field information
+            fields_info = []
+            for field_name, field_info in tool.model_fields.items():
+                field_desc = field_info.description or ""
+                fields_info.append(f"  - {field_name}: {field_desc}")
+
+            tool_text = f"- **{tool_name}**: {tool_desc}"
+            if fields_info:
+                tool_text += "\n" + "\n".join(fields_info)
+            tool_descriptions.append(tool_text)
+
+        elif hasattr(tool, 'name') and hasattr(tool, 'description'):
+            # LangChain tools
+            tool_descriptions.append(f"- **{tool.name}**: {tool.description}")
+
+            # Add parameter info if available
+            if hasattr(tool, 'args_schema') and tool.args_schema:
+                schema = tool.args_schema.model_json_schema()
+                if 'properties' in schema:
+                    for param_name, param_info in schema['properties'].items():
+                        param_desc = param_info.get('description', '')
+                        tool_descriptions.append(f"  - {param_name}: {param_desc}")
+
+    return "\n".join(tool_descriptions)
+
+def parse_ollama_tool_call(response_text: str) -> tuple[str, dict | None]:
+    """Parse Ollama model response for tool calls.
+
+    Expected format:
+    ```
+    Thought: <reasoning>
+    Action: <tool_name>
+    Action Input: <json_parameters>
+    ```
+
+    Or for completion:
+    ```
+    Thought: <reasoning>
+    Final Answer: <response>
+    ```
+
+    Args:
+        response_text: The model's response text
+
+    Returns:
+        Tuple of (action_type, action_data) where:
+        - action_type is "tool_call", "final_answer", or "none"
+        - action_data is the parsed tool call data or final answer
+    """
+    response_text = response_text.strip()
+
+    # Check for Final Answer
+    if "Final Answer:" in response_text or "FINAL ANSWER:" in response_text:
+        # Extract final answer
+        if "Final Answer:" in response_text:
+            final_answer = response_text.split("Final Answer:", 1)[1].strip()
+        else:
+            final_answer = response_text.split("FINAL ANSWER:", 1)[1].strip()
+        return ("final_answer", final_answer)
+
+    # Check for Action (tool call)
+    if "Action:" in response_text or "ACTION:" in response_text:
+        try:
+            # Extract action and input
+            if "Action:" in response_text:
+                action_part = response_text.split("Action:", 1)[1]
+            else:
+                action_part = response_text.split("ACTION:", 1)[1]
+
+            # Get tool name (first line after Action:)
+            lines = action_part.strip().split('\n')
+            tool_name = lines[0].strip()
+
+            # Get action input
+            action_input = {}
+            if "Action Input:" in response_text or "ACTION INPUT:" in response_text:
+                if "Action Input:" in response_text:
+                    input_part = response_text.split("Action Input:", 1)[1].strip()
+                else:
+                    input_part = response_text.split("ACTION INPUT:", 1)[1].strip()
+
+                # Try to parse as JSON
+                # Look for JSON block
+                if '{' in input_part:
+                    json_start = input_part.find('{')
+                    json_end = input_part.rfind('}') + 1
+                    if json_end > json_start:
+                        json_str = input_part[json_start:json_end]
+                        try:
+                            action_input = json.loads(json_str)
+                        except json.JSONDecodeError:
+                            # If JSON parsing fails, use the raw string
+                            action_input = {"input": input_part}
+                else:
+                    # No JSON, use raw input
+                    action_input = {"input": input_part}
+
+            return ("tool_call", {"tool": tool_name, "input": action_input})
+
+        except Exception as e:
+            logging.warning(f"Failed to parse tool call from response: {e}")
+            return ("none", None)
+
+    # No clear action detected
+    return ("none", None)
+
+async def get_ollama_react_response(
+    model: BaseChatModel,
+    messages: List[MessageLikeRepresentation],
+    tools: List[Any],
+    system_prompt: str = None
+) -> AIMessage:
+    """Get a single ReAct-style response from Ollama model.
+
+    This prepares messages with tool descriptions and ReAct formatting instructions,
+    then gets one response from the model. The response will be in ReAct format
+    that can be parsed for tool calls.
+
+    Args:
+        model: The Ollama chat model
+        messages: Conversation messages
+        tools: List of available tools
+        system_prompt: Optional system prompt to prepend
+
+    Returns:
+        AIMessage with model's response in ReAct format
+    """
+    # Format tools for the model
+    tools_text = format_tools_for_ollama(tools)
+
+    # Create ReAct instruction
+    react_instruction = f"""You are a helpful AI assistant that can use tools to help answer questions.
+
+Available Tools:
+{tools_text}
+
+To use a tool, respond in this exact format:
+Thought: [Your reasoning about what to do next]
+Action: [Tool name from the list above]
+Action Input: {{"parameter": "value"}}
+
+When you have enough information to provide a final answer, respond in this format:
+Thought: [Your final reasoning]
+Final Answer: [Your complete answer]
+
+IMPORTANT:
+- Always start with "Thought:" to explain your reasoning
+- Use "Action:" with the EXACT tool name from the available tools list
+- Use "Action Input:" with valid JSON containing the required parameters
+- Use "Final Answer:" only when you're ready to provide the complete final response
+- Only call ONE tool per response"""
+
+    # Add system prompt if provided
+    if system_prompt:
+        react_instruction = system_prompt + "\n\n" + react_instruction
+
+    # Create working message list with ReAct instructions
+    working_messages = [SystemMessage(content=react_instruction)] + list(messages)
+
+    # Get model response
+    response = await model.ainvoke(working_messages)
+
+    return response
+
+def normalize_tool_parameters(tool_name: str, tool_input: dict) -> dict:
+    """Normalize tool parameters to handle common LLM variations in parameter naming.
+
+    This helps make tool calling more robust when LLMs use slightly different
+    parameter names than what's expected by the tool schemas.
+
+    Args:
+        tool_name: Name of the tool being called
+        tool_input: Original parameters from the LLM
+
+    Returns:
+        Normalized parameters that match the tool's expected schema
+    """
+    if not isinstance(tool_input, dict):
+        return tool_input
+
+    normalized = tool_input.copy()
+
+    # Normalize think_tool parameters
+    if tool_name == "think_tool":
+        # Map common variations to 'reflection'
+        if 'reflection' not in normalized:
+            for alt_key in ['prompt', 'thought', 'thinking', 'question', 'input', 'content']:
+                if alt_key in normalized:
+                    normalized['reflection'] = normalized.pop(alt_key)
+                    break
+            # If still no reflection and dict is not empty, use first value
+            if 'reflection' not in normalized and normalized:
+                first_key = list(normalized.keys())[0]
+                normalized['reflection'] = normalized.pop(first_key)
+            # If dict is empty, provide a default
+            if 'reflection' not in normalized:
+                normalized['reflection'] = "Reflecting on progress..."
+
+    # Normalize searxng_search parameters
+    elif tool_name == "searxng_search":
+        # Convert 'query' (singular) to 'queries' (list)
+        if 'queries' not in normalized and 'query' in normalized:
+            query_value = normalized.pop('query')
+            # Ensure it's a list
+            if isinstance(query_value, str):
+                normalized['queries'] = [query_value]
+            elif isinstance(query_value, list):
+                normalized['queries'] = query_value
+            else:
+                normalized['queries'] = [str(query_value)]
+        # Ensure queries is a list if present
+        elif 'queries' in normalized and not isinstance(normalized['queries'], list):
+            normalized['queries'] = [str(normalized['queries'])]
+
+    return normalized
+
+async def execute_tool(tools: List[Any], tool_name: str, tool_input: dict) -> str:
+    """Execute a tool and return its result as a string.
+
+    Args:
+        tools: List of available tools
+        tool_name: Name of the tool to execute
+        tool_input: Parameters for the tool
+
+    Returns:
+        String representation of the tool's result
+    """
+    # Normalize tool input parameters for common variations
+    tool_input = normalize_tool_parameters(tool_name, tool_input)
+
+    # Find the tool
+    target_tool = None
+    for tool in tools:
+        if isinstance(tool, dict):
+            if tool.get('name') == tool_name or tool.get('type') == tool_name:
+                target_tool = tool
+                break
+        elif isinstance(tool, type) and issubclass(tool, BaseModel):
+            if tool.__name__ == tool_name:
+                target_tool = tool
+                break
+        elif hasattr(tool, 'name') and tool.name == tool_name:
+            target_tool = tool
+            break
+
+    if target_tool is None:
+        return f"Error: Tool '{tool_name}' not found. Available tools: {', '.join([str(t.get('name', t.__name__ if hasattr(t, '__name__') else str(t))) for t in tools])}"
+
+    try:
+        # Execute based on tool type
+        if isinstance(target_tool, dict):
+            # Can't execute dict-based tools (they're API-level)
+            return f"Tool {tool_name} requires API-level support (not available with Ollama)"
+
+        elif isinstance(target_tool, type) and issubclass(target_tool, BaseModel):
+            # Pydantic model tool - return instantiated object
+            instance = target_tool(**tool_input)
+            return f"Called {tool_name}: {instance.model_dump_json()}"
+
+        elif hasattr(target_tool, 'ainvoke'):
+            # Async LangChain tool
+            result = await target_tool.ainvoke(tool_input)
+            return str(result)
+
+        elif hasattr(target_tool, 'invoke'):
+            # Sync LangChain tool
+            result = target_tool.invoke(tool_input)
+            return str(result)
+
+        elif callable(target_tool):
+            # Callable tool
+            if asyncio.iscoroutinefunction(target_tool):
+                result = await target_tool(**tool_input)
+            else:
+                result = target_tool(**tool_input)
+            return str(result)
+
+        else:
+            return f"Error: Don't know how to execute tool {tool_name}"
+
+    except Exception as e:
+        logging.error(f"Error executing tool {tool_name}: {e}")
+        return f"Error executing {tool_name}: {str(e)}"
 
 ##########################
 # Reflection Tool Utils
@@ -530,39 +1206,49 @@ async def load_mcp_tools(
 
 async def get_search_tool(search_api: SearchAPI):
     """Configure and return search tools based on the specified API provider.
-    
+
     Args:
-        search_api: The search API provider to use (Anthropic, OpenAI, Tavily, or None)
-        
+        search_api: The search API provider to use (Anthropic, OpenAI, Tavily, SearXNG, or None)
+
     Returns:
         List of configured search tool objects for the specified provider
     """
     if search_api == SearchAPI.ANTHROPIC:
         # Anthropic's native web search with usage limits
         return [{
-            "type": "web_search_20250305", 
-            "name": "web_search", 
+            "type": "web_search_20250305",
+            "name": "web_search",
             "max_uses": 5
         }]
-        
+
     elif search_api == SearchAPI.OPENAI:
         # OpenAI's web search preview functionality
         return [{"type": "web_search_preview"}]
-        
+
     elif search_api == SearchAPI.TAVILY:
         # Configure Tavily search tool with metadata
         search_tool = tavily_search
         search_tool.metadata = {
-            **(search_tool.metadata or {}), 
-            "type": "search", 
+            **(search_tool.metadata or {}),
+            "type": "search",
             "name": "web_search"
         }
         return [search_tool]
-        
+
+    elif search_api == SearchAPI.SEARXNG:
+        # Configure SearXNG local search tool with metadata
+        search_tool = searxng_search
+        search_tool.metadata = {
+            **(search_tool.metadata or {}),
+            "type": "search",
+            "name": "web_search"
+        }
+        return [search_tool]
+
     elif search_api == SearchAPI.NONE:
         # No search functionality configured
         return []
-        
+
     # Default fallback for unknown search API types
     return []
     

@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(test -f C:UsersjordanIdeaProjectsopen_deep_researchdocker-compose.yml)",
+      "Bash(test -d C:UsersjordanIdeaProjectsopen_deep_researchsearxng)",
+      "Bash(test -d C:UsersjordanIdeaProjectsopen_deep_researchscripts)",
+      "Bash(chmod +x scripts/*.sh)",
+      "Bash(cat .env)",
+      "Bash(docker info)",
+      "Bash(/dev/null)",
+      "Bash(docker-compose up -d)",
+      "Bash(docker-compose ps)",
+      "Bash(python test_local.py)",
+      "Bash(python examples/local_ollama_examples/example_medical_research.py)",
+      "Bash(test:*)",
+      "Bash(ollama list:*)",
+      "Bash(python examples/local_ollama_examples/example_quantum_computing.py:*)",
+      "Bash(python examples/local_ollama_examples/example_ai_safety.py:*)",
+      "Bash(python examples/local_ollama_examples/example_climate_tech.py:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

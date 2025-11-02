@@ -41,14 +41,19 @@ from open_deep_research.state import (
 )
 from open_deep_research.utils import (
     anthropic_websearch_called,
+    execute_tool,
     get_all_tools,
     get_api_key_for_model,
     get_model_token_limit,
     get_notes_from_tool_calls,
+    get_ollama_react_response,
+    get_structured_output_from_model,
     get_today_str,
     is_token_limit_exceeded,
     openai_websearch_called,
+    parse_ollama_tool_call,
     remove_up_to_last_ai_message,
+    supports_structured_output,
     think_tool,
 )
 
@@ -84,21 +89,28 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
         "api_key": get_api_key_for_model(configurable.research_model, config),
         "tags": ["langsmith:nostream"]
     }
-    
-    # Configure model with structured output and retry logic
+
+    # Configure model with retry logic
     clarification_model = (
         configurable_model
-        .with_structured_output(ClarifyWithUser)
         .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
         .with_config(model_config)
     )
-    
+
     # Step 3: Analyze whether clarification is needed
     prompt_content = clarify_with_user_instructions.format(
-        messages=get_buffer_string(messages), 
+        messages=get_buffer_string(messages),
         date=get_today_str()
     )
-    response = await clarification_model.ainvoke([HumanMessage(content=prompt_content)])
+
+    # Get structured output with Ollama support
+    response = await get_structured_output_from_model(
+        clarification_model,
+        configurable.research_model,
+        [HumanMessage(content=prompt_content)],
+        ClarifyWithUser,
+        "clarification_analysis"
+    )
     
     # Step 4: Route based on clarification analysis
     if response.need_clarification:
@@ -137,21 +149,28 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
         "api_key": get_api_key_for_model(configurable.research_model, config),
         "tags": ["langsmith:nostream"]
     }
-    
-    # Configure model for structured research question generation
+
+    # Configure model with retry logic
     research_model = (
         configurable_model
-        .with_structured_output(ResearchQuestion)
         .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
         .with_config(research_model_config)
     )
-    
+
     # Step 2: Generate structured research brief from user messages
     prompt_content = transform_messages_into_research_topic_prompt.format(
         messages=get_buffer_string(state.get("messages", [])),
         date=get_today_str()
     )
-    response = await research_model.ainvoke([HumanMessage(content=prompt_content)])
+
+    # Get structured output with Ollama support
+    response = await get_structured_output_from_model(
+        research_model,
+        configurable.research_model,
+        [HumanMessage(content=prompt_content)],
+        ResearchQuestion,
+        "research_brief"
+    )
     
     # Step 3: Initialize supervisor with research brief and instructions
     supervisor_system_prompt = lead_researcher_prompt.format(
@@ -175,19 +194,19 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     )
 
 
-async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[Literal["supervisor_tools"]]:
+async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[Literal["supervisor_tools", "__end__"]]:
     """Lead research supervisor that plans research strategy and delegates to researchers.
-    
+
     The supervisor analyzes the research brief and decides how to break down the research
     into manageable tasks. It can use think_tool for strategic planning, ConductResearch
     to delegate tasks to sub-researchers, or ResearchComplete when satisfied with findings.
-    
+
     Args:
         state: Current supervisor state with messages and research context
         config: Runtime configuration with model settings
-        
+
     Returns:
-        Command to proceed to supervisor_tools for tool execution
+        Command to proceed to supervisor_tools for tool execution or end if using Ollama
     """
     # Step 1: Configure the supervisor model with available tools
     configurable = Configuration.from_runnable_config(config)
@@ -197,30 +216,66 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
         "api_key": get_api_key_for_model(configurable.research_model, config),
         "tags": ["langsmith:nostream"]
     }
-    
+
     # Available tools: research delegation, completion signaling, and strategic thinking
     lead_researcher_tools = [ConductResearch, ResearchComplete, think_tool]
-    
-    # Configure model with tools, retry logic, and model settings
-    research_model = (
-        configurable_model
-        .bind_tools(lead_researcher_tools)
-        .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
-        .with_config(research_model_config)
-    )
-    
-    # Step 2: Generate supervisor response based on current context
+
+    # Get supervisor messages
     supervisor_messages = state.get("supervisor_messages", [])
-    response = await research_model.ainvoke(supervisor_messages)
-    
-    # Step 3: Update state and proceed to tool execution
-    return Command(
-        goto="supervisor_tools",
-        update={
-            "supervisor_messages": [response],
-            "research_iterations": state.get("research_iterations", 0) + 1
-        }
-    )
+
+    # Check if model supports native tool calling
+    if supports_structured_output(configurable.research_model):
+        # Use native tool calling for OpenAI/Anthropic
+        research_model = (
+            configurable_model
+            .bind_tools(lead_researcher_tools)
+            .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
+            .with_config(research_model_config)
+        )
+
+        # Step 2: Generate supervisor response based on current context
+        response = await research_model.ainvoke(supervisor_messages)
+
+        # Step 3: Update state and proceed to tool execution
+        return Command(
+            goto="supervisor_tools",
+            update={
+                "supervisor_messages": [response],
+                "research_iterations": state.get("research_iterations", 0) + 1
+            }
+        )
+    else:
+        # Use ReAct-style tool calling for Ollama
+        research_model = (
+            configurable_model
+            .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
+            .with_config(research_model_config)
+        )
+
+        # Get system prompt from first message if it exists
+        system_prompt = None
+        if supervisor_messages and isinstance(supervisor_messages[0], SystemMessage):
+            system_prompt = supervisor_messages[0].content
+            working_messages = supervisor_messages[1:]
+        else:
+            working_messages = supervisor_messages
+
+        # Get Ollama response in ReAct format
+        response = await get_ollama_react_response(
+            research_model,
+            working_messages,
+            lead_researcher_tools,
+            system_prompt=system_prompt
+        )
+
+        # Return to supervisor_tools which will parse and execute the tool call
+        return Command(
+            goto="supervisor_tools",
+            update={
+                "supervisor_messages": [response],
+                "research_iterations": state.get("research_iterations", 0) + 1
+            }
+        )
 
 async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Command[Literal["supervisor", "__end__"]]:
     """Execute tools called by the supervisor, including research delegation and strategic thinking.
@@ -242,15 +297,48 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     supervisor_messages = state.get("supervisor_messages", [])
     research_iterations = state.get("research_iterations", 0)
     most_recent_message = supervisor_messages[-1]
-    
+
+    # Handle Ollama ReAct-style responses vs native tool calls
+    tool_calls_to_process = []
+    is_ollama = not supports_structured_output(configurable.research_model)
+
+    if is_ollama:
+        # Parse Ollama ReAct response
+        response_text = most_recent_message.content if hasattr(most_recent_message, 'content') else str(most_recent_message)
+        action_type, action_data = parse_ollama_tool_call(response_text)
+
+        if action_type == "final_answer" or action_type == "none":
+            # Research is complete or no clear action
+            return Command(
+                goto=END,
+                update={
+                    "notes": get_notes_from_tool_calls(supervisor_messages),
+                    "research_brief": state.get("research_brief", "")
+                }
+            )
+        elif action_type == "tool_call":
+            # Convert Ollama tool call to standard format
+            tool_name = action_data["tool"]
+            tool_input = action_data["input"]
+
+            # Create a pseudo tool_call structure
+            tool_calls_to_process.append({
+                "name": tool_name,
+                "args": tool_input,
+                "id": f"ollama_{research_iterations}"  # Generate a simple ID
+            })
+    else:
+        # Native tool calls from OpenAI/Anthropic
+        tool_calls_to_process = most_recent_message.tool_calls or []
+
     # Define exit criteria for research phase
     exceeded_allowed_iterations = research_iterations > configurable.max_researcher_iterations
-    no_tool_calls = not most_recent_message.tool_calls
+    no_tool_calls = len(tool_calls_to_process) == 0
     research_complete_tool_call = any(
-        tool_call["name"] == "ResearchComplete" 
-        for tool_call in most_recent_message.tool_calls
+        tool_call["name"] == "ResearchComplete"
+        for tool_call in tool_calls_to_process
     )
-    
+
     # Exit if any termination condition is met
     if exceeded_allowed_iterations or no_tool_calls or research_complete_tool_call:
         return Command(
@@ -264,24 +352,31 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     # Step 2: Process all tool calls together (both think_tool and ConductResearch)
     all_tool_messages = []
     update_payload = {"supervisor_messages": []}
-    
+
     # Handle think_tool calls (strategic reflection)
     think_tool_calls = [
-        tool_call for tool_call in most_recent_message.tool_calls 
+        tool_call for tool_call in tool_calls_to_process
         if tool_call["name"] == "think_tool"
     ]
-    
+
     for tool_call in think_tool_calls:
-        reflection_content = tool_call["args"]["reflection"]
-        all_tool_messages.append(ToolMessage(
-            content=f"Reflection recorded: {reflection_content}",
-            name="think_tool",
-            tool_call_id=tool_call["id"]
-        ))
-    
+        reflection_content = tool_call["args"].get("reflection", "")
+
+        # For Ollama, create a HumanMessage with observation instead of ToolMessage
+        if is_ollama:
+            all_tool_messages.append(HumanMessage(
+                content=f"Observation: Reflection recorded: {reflection_content}"
+            ))
+        else:
+            all_tool_messages.append(ToolMessage(
+                content=f"Reflection recorded: {reflection_content}",
+                name="think_tool",
+                tool_call_id=tool_call["id"]
+            ))
+
     # Handle ConductResearch calls (research delegation)
     conduct_research_calls = [
-        tool_call for tool_call in most_recent_message.tool_calls 
+        tool_call for tool_call in tool_calls_to_process
         if tool_call["name"] == "ConductResearch"
     ]
     
@@ -306,19 +401,33 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
             
             # Create tool messages with research results
             for observation, tool_call in zip(tool_results, allowed_conduct_research_calls):
-                all_tool_messages.append(ToolMessage(
-                    content=observation.get("compressed_research", "Error synthesizing research report: Maximum retries exceeded"),
-                    name=tool_call["name"],
-                    tool_call_id=tool_call["id"]
-                ))
-            
+                research_result = observation.get("compressed_research", "Error synthesizing research report: Maximum retries exceeded")
+
+                if is_ollama:
+                    all_tool_messages.append(HumanMessage(
+                        content=f"Observation: Research completed on '{tool_call['args'].get('research_topic', 'unknown')}':\n\n{research_result}"
+                    ))
+                else:
+                    all_tool_messages.append(ToolMessage(
+                        content=research_result,
+                        name=tool_call["name"],
+                        tool_call_id=tool_call["id"]
+                    ))
+
             # Handle overflow research calls with error messages
             for overflow_call in overflow_conduct_research_calls:
-                all_tool_messages.append(ToolMessage(
-                    content=f"Error: Did not run this research as you have already exceeded the maximum number of concurrent research units. Please try again with {configurable.max_concurrent_research_units} or fewer research units.",
-                    name="ConductResearch",
-                    tool_call_id=overflow_call["id"]
-                ))
+                error_msg = f"Error: Did not run this research as you have already exceeded the maximum number of concurrent research units. Please try again with {configurable.max_concurrent_research_units} or fewer research units."
+
+                if is_ollama:
+                    all_tool_messages.append(HumanMessage(
+                        content=f"Observation: {error_msg}"
+                    ))
+                else:
+                    all_tool_messages.append(ToolMessage(
+                        content=error_msg,
+                        name="ConductResearch",
+                        tool_call_id=overflow_call["id"]
+                    ))
             
             # Aggregate raw notes from all research results
             raw_notes_concat = "\n".join([
@@ -395,25 +504,42 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
         "api_key": get_api_key_for_model(configurable.research_model, config),
         "tags": ["langsmith:nostream"]
     }
-    
+
     # Prepare system prompt with MCP context if available
     researcher_prompt = research_system_prompt.format(
-        mcp_prompt=configurable.mcp_prompt or "", 
+        mcp_prompt=configurable.mcp_prompt or "",
         date=get_today_str()
     )
-    
-    # Configure model with tools, retry logic, and settings
-    research_model = (
-        configurable_model
-        .bind_tools(tools)
-        .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
-        .with_config(research_model_config)
-    )
-    
-    # Step 3: Generate researcher response with system context
-    messages = [SystemMessage(content=researcher_prompt)] + researcher_messages
-    response = await research_model.ainvoke(messages)
-    
+
+    # Check if model supports native tool calling
+    if supports_structured_output(configurable.research_model):
+        # Use native tool calling for OpenAI/Anthropic
+        research_model = (
+            configurable_model
+            .bind_tools(tools)
+            .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
+            .with_config(research_model_config)
+        )
+
+        # Step 3: Generate researcher response with system context
+        messages = [SystemMessage(content=researcher_prompt)] + researcher_messages
+        response = await research_model.ainvoke(messages)
+    else:
+        # Use ReAct-style tool calling for Ollama
+        research_model = (
+            configurable_model
+            .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
+            .with_config(research_model_config)
+        )
+
+        # Generate Ollama response in ReAct format
+        response = await get_ollama_react_response(
+            research_model,
+            researcher_messages,
+            tools,
+            system_prompt=researcher_prompt
+        )
+
     # Step 4: Update state and proceed to tool execution
     return Command(
         goto="researcher_tools",
@@ -452,56 +578,88 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
     configurable = Configuration.from_runnable_config(config)
     researcher_messages = state.get("researcher_messages", [])
     most_recent_message = researcher_messages[-1]
-    
-    # Early exit if no tool calls were made (including native web search)
-    has_tool_calls = bool(most_recent_message.tool_calls)
-    has_native_search = (
-        openai_websearch_called(most_recent_message) or 
-        anthropic_websearch_called(most_recent_message)
-    )
-    
-    if not has_tool_calls and not has_native_search:
+
+    # Check if using Ollama
+    is_ollama = not supports_structured_output(configurable.research_model)
+
+    # Handle Ollama ReAct-style responses vs native tool calls
+    tool_calls_to_process = []
+
+    if is_ollama:
+        # Parse Ollama ReAct response
+        response_text = most_recent_message.content if hasattr(most_recent_message, 'content') else str(most_recent_message)
+        action_type, action_data = parse_ollama_tool_call(response_text)
+
+        if action_type == "final_answer" or action_type == "none":
+            # Research is complete
+            return Command(goto="compress_research")
+        elif action_type == "tool_call":
+            # Convert Ollama tool call to standard format
+            tool_name = action_data["tool"]
+            tool_input = action_data["input"]
+
+            tool_calls_to_process.append({
+                "name": tool_name,
+                "args": tool_input,
+                "id": f"ollama_{state.get('tool_call_iterations', 0)}"
+            })
+    else:
+        # Native tool calls from OpenAI/Anthropic
+        has_tool_calls = bool(most_recent_message.tool_calls)
+        has_native_search = (
+            openai_websearch_called(most_recent_message) or
+            anthropic_websearch_called(most_recent_message)
+        )
+
+        if not has_tool_calls and not has_native_search:
+            return Command(goto="compress_research")
+
+        tool_calls_to_process = most_recent_message.tool_calls or []
+
+    # Early exit if no tools to process
+    if not tool_calls_to_process:
         return Command(goto="compress_research")
-    
-    # Step 2: Handle other tool calls (search, MCP tools, etc.)
+
+    # Step 2: Execute tool calls
     tools = await get_all_tools(config)
-    tools_by_name = {
-        tool.name if hasattr(tool, "name") else tool.get("name", "web_search"): tool 
-        for tool in tools
-    }
-    
-    # Execute all tool calls in parallel
-    tool_calls = most_recent_message.tool_calls
-    tool_execution_tasks = [
-        execute_tool_safely(tools_by_name[tool_call["name"]], tool_call["args"], config) 
-        for tool_call in tool_calls
-    ]
-    observations = await asyncio.gather(*tool_execution_tasks)
-    
-    # Create tool messages from execution results
-    tool_outputs = [
-        ToolMessage(
-            content=observation,
-            name=tool_call["name"],
-            tool_call_id=tool_call["id"]
-        ) 
-        for observation, tool_call in zip(observations, tool_calls)
-    ]
-    
+    tool_outputs = []
+
+    for tool_call in tool_calls_to_process:
+        tool_name = tool_call["name"]
+        tool_args = tool_call["args"]
+
+        # Execute the tool using our helper from utils
+        try:
+            observation = await execute_tool(tools, tool_name, tool_args)
+        except Exception as e:
+            observation = f"Error executing {tool_name}: {str(e)}"
+
+        # Create appropriate message type
+        if is_ollama:
+            tool_outputs.append(HumanMessage(
+                content=f"Observation: {observation}"
+            ))
+        else:
+            tool_outputs.append(ToolMessage(
+                content=observation,
+                name=tool_name,
+                tool_call_id=tool_call["id"]
+            ))
+
     # Step 3: Check late exit conditions (after processing tools)
     exceeded_iterations = state.get("tool_call_iterations", 0) >= configurable.max_react_tool_calls
     research_complete_called = any(
-        tool_call["name"] == "ResearchComplete" 
-        for tool_call in most_recent_message.tool_calls
+        tool_call["name"] == "ResearchComplete"
+        for tool_call in tool_calls_to_process
     )
-    
+
     if exceeded_iterations or research_complete_called:
         # End research and proceed to compression
         return Command(
             goto="compress_research",
             update={"researcher_messages": tool_outputs}
         )
-    
+
     # Continue research loop with tool results
     return Command(
         goto="researcher",
